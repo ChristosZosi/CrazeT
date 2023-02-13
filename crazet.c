@@ -29,12 +29,9 @@
  */
 
 /* CrazeT includes. */
+#include <config_ct.h>
 #include "crazet.h"
 #include "radio_hw_ct.h"
-#include "timer_hw_ct.h"
-#include "debug_ct.h"
-
-/* Nordic Semiconductors includes. */
 #include <nrf.h>
 
 /* Standard libraries includes. */
@@ -55,13 +52,15 @@
 #define DEFAULT_JOIN_ADDR       (0xFE)
 #define DEFAULT_TX_ADDRR        DEFAULT_JOIN_ADDR
 
-#define CRAZET_RADIO_DEFAULT_SHORTS (RADIO_SHORTS_READY_START_Enabled << RADIO_SHORTS_READY_START_Pos) | \
-	                                (RADIO_SHORTS_END_DISABLE_Enabled << RADIO_SHORTS_END_DISABLE_Msk)
+#define CRAZET_RADIO_DEFAULT_SHORTS (RADIO_SHORTS_READY_START_Enabled       << RADIO_SHORTS_READY_START_Pos       | \
+									 RADIO_SHORTS_ADDRESS_RSSISTART_Enabled << RADIO_SHORTS_ADDRESS_RSSISTART_Pos | \
+									 RADIO_SHORTS_END_DISABLE_Enabled       << RADIO_SHORTS_END_DISABLE_Pos       | \
+									 RADIO_SHORTS_DISABLED_RSSISTOP_Enabled << RADIO_SHORTS_DISABLED_RSSISTOP_Pos)
 
-#define CRAZET_TIMER_DEFAULT_SHORTS (TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos)
+#define CRAZET_TIMER_DEFAULT_SHORTS (TIMER_SHORTS_COMPARE0_CLEAR_Enabled << TIMER_SHORTS_COMPARE0_CLEAR_Pos | \
+									 TIMER_SHORTS_COMPARE0_STOP_Enabled  << TIMER_SHORTS_COMPARE0_STOP_Pos)
 
-#define START_RSSI_TIMER_CC_REG 0
-#define STOP_RSSSI_TIMER_CC_REG 1
+#define CRAZET_TIMER_CC0_REG 0
 
 /* CrazeT RX and TX FIFO queue sizes */
 #define CRAZET_RX_FIFO_QUEUE_SIZE 32
@@ -74,46 +73,16 @@
 
 #define PPI NRF_PPI
 
-#define PPI_GROUP                           (0)
-
-#define PPI_RADIO_RSSI_START_ON_CC0         (0)
-#define PPI_TIMER_CLEAR_ON_CC1              (1)
-#define PPI_RADIO_RSSI_STOP_ON_CC1          (2)
-#define PPI_ENABLE_PPI_GROUP_ON_CC0         (3)
-#define PPI_DISABLE_PPI_GROUP_ON_CC1        (4)
-#define PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR    (5)
-#define PPI_DISABLE_PPI_GROUP_ON_RADIO_ADDR (6)
-#define PPI_RADIO_RSSI_STOP_ON_RADIO_ADDR   (7)
+#define PPI_RADIO_DISABLE_ON_CC0           (0)
+#define PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR   (1)
 
 static void enableCrazetPPISystem() {
 
-	PPI->CH[PPI_RADIO_RSSI_START_ON_CC0].EEP  = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[START_RSSI_TIMER_CC_REG];
-	PPI->CH[PPI_RADIO_RSSI_START_ON_CC0].TEP  = (uint32_t)&CRAZET_RADIO->TASKS_RSSISTART;
+	PPI->CH[PPI_RADIO_DISABLE_ON_CC0].EEP  = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[CRAZET_TIMER_CC0_REG];
+	PPI->CH[PPI_RADIO_DISABLE_ON_CC0].TEP  = (uint32_t)&CRAZET_RADIO->TASKS_DISABLE;
 
-	PPI->CH[PPI_TIMER_CLEAR_ON_CC1].EEP       = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[STOP_RSSSI_TIMER_CC_REG];
-	PPI->CH[PPI_TIMER_CLEAR_ON_CC1].TEP       = (uint32_t)&CRAZET_TIMER->TASKS_CLEAR;
-
-	PPI->CH[PPI_RADIO_RSSI_STOP_ON_CC1].EEP   = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[STOP_RSSSI_TIMER_CC_REG];
-	PPI->CH[PPI_RADIO_RSSI_STOP_ON_CC1].TEP   = (uint32_t)&CRAZET_RADIO->TASKS_RSSISTOP;
-
-	PPI->CH[PPI_ENABLE_PPI_GROUP_ON_CC0].EEP  = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[START_RSSI_TIMER_CC_REG];
-	PPI->CH[PPI_ENABLE_PPI_GROUP_ON_CC0].TEP  = (uint32_t)&PPI->TASKS_CHG[PPI_GROUP].EN;
-
-	PPI->CH[PPI_DISABLE_PPI_GROUP_ON_CC1].EEP = (uint32_t)&CRAZET_TIMER->EVENTS_COMPARE[STOP_RSSSI_TIMER_CC_REG];
-	PPI->CH[PPI_DISABLE_PPI_GROUP_ON_CC1].TEP = (uint32_t)&PPI->TASKS_CHG[PPI_GROUP].DIS;
-
-	PPI->CH[PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR].EEP = (uint32_t)&CRAZET_RADIO->EVENTS_ADDRESS;
-	PPI->CH[PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR].TEP = (uint32_t)&CRAZET_TIMER->TASKS_SHUTDOWN;
-
-	PPI->CH[PPI_DISABLE_PPI_GROUP_ON_RADIO_ADDR].EEP = (uint32_t)&CRAZET_RADIO->EVENTS_ADDRESS;
-	PPI->CH[PPI_DISABLE_PPI_GROUP_ON_RADIO_ADDR].TEP = (uint32_t)&PPI->TASKS_CHG[PPI_GROUP].DIS;
-
-	PPI->CH[PPI_RADIO_RSSI_STOP_ON_RADIO_ADDR].EEP   = (uint32_t)&CRAZET_RADIO->EVENTS_ADDRESS;
-	PPI->CH[PPI_RADIO_RSSI_STOP_ON_RADIO_ADDR].TEP   = (uint32_t)&CRAZET_RADIO->TASKS_RSSISTOP;
-
-	PPI->CHG[PPI_GROUP] = PPI_CHG_CH0_Included << PPI_CHG_CH0_Pos |
-						  PPI_CHG_CH1_Included << PPI_CHG_CH1_Pos;
-
+	PPI->CH[PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR].EEP = (uint32_t)&CRAZET_RADIO->EVENTS_END;
+	PPI->CH[PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR].TEP = (uint32_t)&CRAZET_TIMER->TASKS_STOP;
 }
 
 /******************************************************************************/
@@ -197,61 +166,23 @@ static inline void tXQueuePop() {
 /******************************************************************************/
 
 /******************************************************************************
- * CRAZET finite state machine
+ * CRAZET finite state machine (FSM)
  ******************************************************************************/
 
-static void onEntryCrazetIdleState();
+/* Handler to be called when a packet has been received. */
+static void radioPacketReceivedHandler();
+/* Handler to be called when a packet has been sent. */
+static void radioPacketSentHandler();
 
-static void crazetIdleStateHandle();
-static void crazetRssiSamplingStateHandle();
-static void crazetWaitAckStateHandle();
-static void crazetWaitCtsStateHandle();
-static void crazetWaitRtsStateHandle();
-
-typedef enum {
-	IDLE_STATE,
-	RSSI_SAMPLING_STATE,
-	WAIT_ACK_STATE,
-	WAIT_CTS_STATE,
-	WAIT_RTS_STATE
-} CrazetState;
-CrazetState crazetState;
-
-void onEntryCrazetIdleState() {
-
-	/* Change the state of the CRAZET FSM to IDLE. */
-	crazetState = IDLE_STATE;
-	RadioOnDisabledRXEventHandler = crazetIdleStateHandle;
-
-	/* Set up and enable the CRAZET PPI modules. */
-
-	/* Rump up the CRAZET RADIO in receiving mode. */
-	// rumpCrazetRadioInRX();
-
-	/* Set up and start the CRAZET TIMER. */
-
+void radioPacketReceivedHandler() {
 
 }
 
-void crazetIdleStateHandle() {
+static void radioPacketSentHandler() {
 
 }
+/******************************************************************************/
 
-void crazetRssiSamplingStateHandle() {
-
-}
-
-void crazetWaitAckStateHandle() {
-
-}
-
-void crazetWaitCtsStateHandle() {
-
-}
-
-void crazetWaitRtsStateHandle() {
-
-}
 
 /******************************************************************************
  * CRAZET public functions
@@ -297,6 +228,11 @@ bool initCrazet(const CrazetConfig * const config) {
 
 	/* Initialize the CRAZET PPI system. */
 	enableCrazetPPISystem();
+
+	/* Initialize the CRAZET FSM. */
+	crazetRadioState = CRAZET_RADIO_RX_STATE;
+	RadioOnDisabledRXEventHandler = radioPacketReceivedHandler;
+	RadioOnDisabledTXEventHandler = radioPacketSentHandler;
 
 	return true;
 }

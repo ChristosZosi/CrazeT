@@ -33,7 +33,6 @@
 
 /* CrazeT includes. */
 #include "radio_hw_ct.h"
-#include "timer_hw_ct.h"
 
 /* Standard libraries includes. */
 #include <stdint.h>
