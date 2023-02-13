@@ -29,10 +29,10 @@
  */
 
 /* CrazeT includes. */
+#include "config_ct.h"
 #include "radio_hw_ct.h"
-#include "debug_ct.h"
 
-/* Nordic Semiconductors includes. */
+/* Nordic Semiconductor include. */
 #include <nrf.h>
 
 /* Standard libraries includes. */
@@ -43,30 +43,24 @@
  ******************************************************************************/
 
 static void interruptStubHandler() {
-	/* TODO: print also interrupt ID */
-	CRAZET_WARN("No handler registered!\r\n");
+	CRAZET_PRINT("No CRAZET_RADIO IRQ handler registered!\r\n");
 }
 
 void RADIO_IRQHandler() {
-	/* TODO: Maybe turn LEDS on/off for debugging features. */
 	if(CRAZET_RADIO->EVENTS_DISABLED && (CRAZET_RADIO->INTENSET & RADIO_INTENSET_DISABLED_Msk)) {
+		CRAZET_RADIO->EVENTS_DISABLED = 0U;
 
 		switch(crazetRadioState) {
-
 		case CRAZET_RADIO_RX_STATE:
+			CRAZET_RX_LED_TOGGLE();
 
-			if(CRAZET_RADIO->CRCSTATUS !=  0UL) {
-
-				if(RadioOnDisabledRXEventHandler) {
-					RadioOnDisabledRXEventHandler();
-				}
-
-			} else {
-				CRAZET_ERROR("CRAZET_RADIO_RX_STATE: CRC failed.");
+			if(RadioOnDisabledRXEventHandler) {
+				RadioOnDisabledRXEventHandler();
 			}
 			break;
 
 		case CRAZET_RADIO_TX_STATE:
+			CRAZET_TX_LED_TOGGLE();
 
 			if(RadioOnDisabledTXEventHandler) {
 				RadioOnDisabledTXEventHandler();
@@ -74,14 +68,7 @@ void RADIO_IRQHandler() {
 			break;
 
 		default:
-			CRAZET_ERROR("Unknown CRAZET RADIO state\r\n");
-		}
-	}
-
-	if(CRAZET_RADIO->EVENTS_RSSIEND && (CRAZET_RADIO->INTENSET & RADIO_INTENSET_RSSIEND_Msk)) {
-
-		if(RadioOnRSSIEndEventHandler) {
-			RadioOnRSSIEndEventHandler();
+			CRAZET_PRINT("Unknown CRAZET RADIO state\r\n");
 		}
 	}
 }
@@ -96,7 +83,6 @@ CrazetRadioState crazetRadioState = CRAZET_RADIO_RX_STATE;
 /* Global function pointers for RADIO event handlers. */
 RadioIRQEventHandler RadioOnDisabledRXEventHandler = interruptStubHandler;
 RadioIRQEventHandler RadioOnDisabledTXEventHandler = interruptStubHandler;
-RadioIRQEventHandler RadioOnRSSIEndEventHandler    = interruptStubHandler;
 /******************************************************************************/
 
 /******************************************************************************

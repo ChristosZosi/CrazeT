@@ -96,7 +96,7 @@ typedef enum {
 } CrazetRadioCrc;
 
 typedef enum {
-	CRAZET_RADIO_RX_STATE,
+	CRAZET_RADIO_RX_STATE = 0,
 	CRAZET_RADIO_TX_STATE
 } CrazetRadioState;
 
@@ -112,7 +112,6 @@ extern CrazetRadioState crazetRadioState;
 /* Global function pointers for RADIO event handlers. */
 extern RadioIRQEventHandler RadioOnDisabledRXEventHandler;
 extern RadioIRQEventHandler RadioOnDisabledTXEventHandler;
-extern RadioIRQEventHandler RadioOnRSSIEndEventHandler;
 /******************************************************************************/
 
 /******************************************************************************
@@ -121,8 +120,8 @@ extern RadioIRQEventHandler RadioOnRSSIEndEventHandler;
 #define CRAZET_RADIO_ENABLE()  (CRAZET_RADIO->POWER = 1u)
 #define CRAZET_RADIO_DISABLE() (CRAZET_RADIO->POWER = 0u)
 
-#define CRAZET_RADIO_ENABLE_IRQ()  NVIC_DisableIRQ(RADIO_IRQn)
-#define CRAZET_RADIO_DISABLE_IRQ() NVIC_EnableIRQ(RADIO_IRQn)
+#define CRAZET_RADIO_ENABLE_IRQ()  NVIC_EnableIRQ(RADIO_IRQn)
+#define CRAZET_RADIO_DISABLE_IRQ() NVIC_DisableIRQ(RADIO_IRQn)
 
 void setCrazetRadioBitRate(CrazetRadioBitrate bitrate);
 void setCrazetRadioTXPower(CrazetRadioTXPower txpower);
