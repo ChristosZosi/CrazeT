@@ -31,26 +31,55 @@
 #ifndef CRAZET_DEBUG_CT_H_
 #define CRAZET_DEBUG_CT_H_
 
-#define CRAZET_DEBUG 1 //TODO: Remove this line
+/* Nordic Semiconductor include. */
+#include <nrf.h>
 
-#ifdef CRAZET_DEBUG
+/* Standard library includes. */
+#include <stdio.h>
 
-void crazetDebugMessage(const char* msg);
-#define CRAZET_MESSAGE(...) \
-		{crazetDebugMessage(__VA_ARGS__);}
+#ifndef CRAZET_TIMER_CONFIG
+	#define CRAZET_TIMER_CONFIG 0
+#endif
 
-void crazetDebugWarn(const char* warn);
-#define CRAZET_WARN(...) \
-		{crazetDebugWarn(__VA_ARGS__);}
+#if CRAZET_TIMER_CONFIG == 0
+	#define CRAZET_TIMER NRF_TIMER0
+#elif CRAZET_TIMER_CONFIG == 1
+	#define CRAZET_TIMER NRF_TIMER1
+#elif CRAZET_TIMER_CONFIG == 2
+	#define CRAZET_TIMER NRF_TIMER2
+#endif /* CRAZET_TIMER_CONFIG */
 
-void crazetDebugError(const char* err);
-#define CRAZET_ERROR(...) \
-		{crazetDebugError(__VA_ARGS__);}
+#ifndef CRAZET_DEBUG_PRINT
+	#define CRAZET_DEBUG_PRINT 0
+#endif /* CRAZET_DEBUG_PRINT */
 
+#ifndef CRAZET_DEBUG_LED
+	#define CRAZET_DEBUG_LED 0
+#endif /* CRAZET_DEBUG_LED */
+
+#if CRAZET_DEBUG_PRINT == 1
+	void crazet_print(const char* msg);
+	#define CRAZET_PRINT(...)           \
+		{					            \
+			char msg[64];               \
+			sprintf(msg, __VA_ARGS__);  \
+			crazet_print(msg);          \
+		}
 #else
-#define CRAZET_MESSAGE(X)
-#define CRAZET_WARNING(X)
-#define CRAZET_ERROR(X)
-#endif /* CRAZET_DEBUG */
+	#define CRAZET_PRINT(...)
+#endif /* CRAZET_DEBUG_PRINT == 1 */
+
+#if CRAZET_DEBUG_LED == 1
+	void crazetToggleRxLED();
+	void crazetToggleTxLED();
+#define CRAZET_RX_LED_TOGGLE() \
+		crazetToggleRxLED()
+#define CRAZET_TX_LED_TOGGLE() \
+		crazetToggleTxLED()
+#else
+	#define CRAZET_RX_LED_TOGGLE()
+	#define CRAZET_TX_LED_TOGGLE()
+#endif /* CRAZET_DEBUG_LED */
+
 
 #endif /* CRAZET_DEBUG_CT_H_ */
