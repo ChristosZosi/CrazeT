@@ -220,17 +220,241 @@ static inline void tXQueuePop() {
  * CRAZET finite state machine (FSM)
  ******************************************************************************/
 
+typedef enum {
+	TIMEOUT_EVENT          = -1,
+	TOKEN_FRAME_EVENT      = TOKEN_FRAME,
+	CTS_FRAME_EVENT        = CTS_FRAME,
+	RTS_FRAME_EVENT        = RTS_FRAME,
+	DATA_FRAME_EVENT       = DATA_FRAME,
+	DATA_ACK_FRAME_EVENT   = DATA_ACK_FRAME,
+	INVITE_FRAME_EVENT     = INVITE_FRAME,
+	INVITE_ACK_FRAME_EVENT = INVITE_ACK_FRAME
+} CrazetEvent;
+
+typedef enum {
+	IDLE_STATE = 0,
+	RX_WAIT_CTS_STATE,
+	RX_WAIT_RTS_STATE,
+	RX_WAIT_DATA_ACK_STATE,
+	RX_WAIT_INVITE_ACK_STATE
+} CrazetState;
+
+typedef struct crazet_finite_state_machine_data {
+	uint8_t successor_id;
+	uint8_t predecessor_id;
+
+	uint8_t token_retries;
+	uint8_t rts_retries;
+	uint8_t data_retries;
+
+	uint32_t data_frame_crc;
+	uint8_t data_frame_src;
+
+	CrazetState state;
+	CrazetState lastState;
+
+	bool is_network_active;
+	uint8_t token_direction;
+	uint32_t token_id;
+
+	CrazetOnAirPacket* retransmitPacket;
+} CrazetFSMData;
+
+static CrazetFSMData fsmData;
+static CrazetOnAirPacket servicePacket;
+
+static void resetCrazetFSMData(CrazetFSMData* data) {
+	data->successor_id   = ctConfig.selfNodeAddress;
+	data->predecessor_id = ctConfig.selfNodeAddress;
+
+	data->token_retries = 0;
+	data->rts_retries   = 0;
+	data->data_retries  = 0;
+
+	data->data_frame_crc = 0;
+	data->data_frame_src = ctConfig.selfNodeAddress;
+
+	data->state     = IDLE_STATE;
+	data->lastState = IDLE_STATE;
+
+	data->is_network_active = false;
+	data->token_direction   = 0;
+	data->token_id          = 0;
+
+	data->retransmitPacket = &servicePacket;
+}
+
+static void initServicePacket(CrazetOnAirPacket* pk) {
+	pk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+	pk->source_id  = ctConfig.selfNodeAddress;
+	pk->target_id  = ctConfig.selfNodeAddress;
+}
+
+typedef void(*CrazetStateHandler)(CrazetEvent event, const CrazetQueuePacket * const pk);
+
+static void idleStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+static void rxWaitCtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+static void rxWaitRtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+static void rxWaitDataAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+static void rxWaitInviteAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+
+static CrazetStateHandler stateHandler[] = {
+		[IDLE_STATE]               = idleStateHandler,
+		[RX_WAIT_CTS_STATE]        = rxWaitCtsStateHandler,
+		[RX_WAIT_RTS_STATE]        = rxWaitRtsStateHandler,
+		[RX_WAIT_DATA_ACK_STATE]   = rxWaitDataAckStateHandler,
+		[RX_WAIT_INVITE_ACK_STATE] = rxWaitInviteAckStateHandler
+};
+
 /* Handler to be called when a packet has been received. */
 static void radioPacketReceivedHandler();
 /* Handler to be called when a packet has been sent. */
 static void radioPacketSentHandler();
 
+static void rumpUpRadioInRx() {
+	CRAZET_RADIO->TASKS_RXEN = 1U;
+	CRAZET_TIMER->TASKS_START = 1U;
+}
+
 void radioPacketReceivedHandler() {
 
+	CrazetEvent event;
+	CrazetQueuePacket* rxPk;
+
+	if(CRAZET_TIMER->EVENTS_COMPARE[CRAZET_TIMER_CC0_REG]) {
+		/* If a timeout occurred. */
+		CRAZET_TIMER->EVENTS_COMPARE[CRAZET_TIMER_CC0_REG] = 0U;
+		event = TIMEOUT_EVENT;
+		rxPk = NULL;
+	} else if(CRAZET_RADIO->EVENTS_END && CRAZET_RADIO->CRCSTATUS != 0) {
+		/* If a new VALID packet has been received. */
+		rxPk = &rxQueue[rxQueueHead];
+
+		rxPk->crc = CRAZET_RADIO->RXCRC;
+		rxPk->rssi = CRAZET_RADIO->RSSISAMPLE;
+		rxPk->logicalAddres = CRAZET_RADIO->RXMATCH;
+
+		event = rxPk->onAirPacket.frameType;
+	} else {
+		/*
+		 * It is quite possible that a corrupted packet has
+		 * been received and the CRAZET_RADIO interrupt
+		 * kicked. In this case we just start the CRAZET_RADIO
+		 * and CRAZET_TIMER and leave the CRAZET state machine
+		 * as it is.
+		 */
+		rumpUpRadioInRx();
+		return;
+	}
+
+	/* Call the handler of the currentState */
+	stateHandler[fsmData.state](event, rxPk);
 }
 
 static void radioPacketSentHandler() {
+	/*
+	 * CRAZET_RADIO is already starting to rump in in RX state,
+	 * because of the SHORT RADIO_SHORTS_DISABLED_TXEN_Enabled.
+	 */
+	CRAZET_RADIO->SHORTS = CRAZET_RADIO_DEFAULT_SHORTS;
+	CRAZET_RADIO->PACKETPTR = (uint32_t)&rxQueue[rxQueueHead].onAirPacket;
 
+	crazetRadioState = CRAZET_RADIO_RX_STATE;
+
+	/* In RX state the timer should always run. */
+	CRAZET_TIMER->TASKS_START = 1U;
+}
+
+static void sendPacketAuto(const CrazetOnAirPacket * const txPk, uint32_t logTxAddres, uint32_t timeout) {
+	CRAZET_RADIO->PACKETPTR = (uint32_t)txPk;
+	CRAZET_RADIO->TXADDRESS = logTxAddres;
+
+	CRAZET_RADIO->SHORTS = CRAZET_RADIO_DEFAULT_SHORTS |
+			RADIO_SHORTS_DISABLED_RXEN_Enabled << RADIO_SHORTS_DISABLED_RXEN_Pos;
+
+	crazetRadioState = CRAZET_RADIO_TX_STATE;
+
+	CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = timeout;
+
+	CRAZET_RADIO->TASKS_TXEN = 1U;
+}
+
+void idleStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
+	switch(event) {
+	case TIMEOUT_EVENT:
+		break;
+	case DATA_FRAME_EVENT:
+		break;
+	case TOKEN_FRAME_EVENT:
+		break;
+	case RTS_FRAME_EVENT:
+		break;
+	case INVITE_FRAME_EVENT:
+		break;
+	default:
+		// TODO: Raise an error
+		/* In stable network should never occur. */
+		rumpUpRadioInRx();
+		break;
+	}
+}
+
+void rxWaitCtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
+	switch(event) {
+	case TIMEOUT_EVENT:
+		break;
+	case CTS_FRAME_EVENT:
+		break;
+	case TOKEN_FRAME_EVENT:
+		break;
+	default:
+		// TODO: Raise an error
+		/* In stable network should never occur. */
+		rumpUpRadioInRx();
+		return;
+	}
+}
+
+void rxWaitRtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
+	switch(event) {
+	case TIMEOUT_EVENT:
+		break;
+	case RTS_FRAME_EVENT:
+		break;
+	default:
+		// TODO: Raise an error
+		/* In stable network should never occur. */
+		rumpUpRadioInRx();
+		return;
+	}
+}
+
+void rxWaitDataAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
+	switch(event) {
+	case TIMEOUT_EVENT:
+		break;
+	case DATA_ACK_FRAME_EVENT:
+		break;
+	default:
+		// TODO: Raise an error
+		/* In stable network should never occur. */
+		rumpUpRadioInRx();
+		return;
+	}
+}
+
+void rxWaitInviteAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
+	switch(event) {
+	case TIMEOUT_EVENT:
+		break;
+	case INVITE_ACK_FRAME_EVENT:
+		break;
+	default:
+		// TODO: Raise an error
+		/* In stable network should never occur. */
+		rumpUpRadioInRx();
+		return;
+	}
 }
 /******************************************************************************/
 
