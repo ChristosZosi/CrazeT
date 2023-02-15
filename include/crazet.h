@@ -42,7 +42,7 @@
  * CRAZET configuration types
  ******************************************************************************/
 #define CRAZET_MAX_PACKET_SIZE			64
-#define CRAZET_MAX_PACKET_DATA_SIZE		32
+#define CRAZET_MAX_PACKET_DATA_SIZE		32 // TODO: set this to an actual value
 
 typedef struct crazet_config_t {
 
@@ -61,11 +61,13 @@ typedef struct crazet_config_t {
 	uint8_t tokenFrameRetransmitAttempts;
 	uint8_t rtsFrameRetransmitAttempts;
 
-	uint8_t rssiSamplingRate;
+	uint32_t networkIdleTimeoutUs;
+	uint32_t invitationTimeoutUs;
 
 	uint8_t selfNodeAddress;
 } CrazetConfig;
 
+// TODO: Determine actual default values for the CrazetConfig
 #define CRAZET_DEFAULT_CONFIG { .bitrate                      = RADIO_MODE_MODE_Nrf_2Mbit,  \
 								.txpower                      = RADIO_TXPOWER_TXPOWER_0dBm, \
 								.channel                      = 100,                        \
@@ -76,12 +78,17 @@ typedef struct crazet_config_t {
 								.dataFrameRetransmitAttempts  = 100,                        \
 								.tokenFrameRetransmitAttempts = 100,                        \
 								.rtsFrameRetransmitAttempts   = 100,                        \
-								.rssiSamplingRate             = 50,                         \
+								.networkIdleTimeoutUs         = 1000000,                    \
+								.invitationTimeoutUs          = 2500,                       \
 								.selfNodeAddress              = 0x01                        \
 }
 
 typedef struct crazet_packet {
+	uint8_t source_id;
+	uint8_t target_id;
 	uint8_t dataSize;
+	bool ack;
+	bool broadcast;
 	uint8_t data[CRAZET_MAX_PACKET_DATA_SIZE];
 } CrazetPacket;
 /******************************************************************************/

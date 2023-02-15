@@ -88,18 +88,69 @@ static void enableCrazetPPISystem() {
 /******************************************************************************/
 
 /******************************************************************************
+ * CRAZET packet and frame types
+ ******************************************************************************/
+typedef enum {
+	TOKEN_FRAME      = 0,
+	CTS_FRAME        = 1,
+	RTS_FRAME        = 2,
+	DATA_FRAME       = 3,
+	DATA_ACK_FRAME   = 4,
+	INVITE_FRAME     = 5,
+	INVITE_ACK_FRAME = 6
+} CrazetFrame;
+
+#define ON_AIR_PACKET_HEADER_SIZE (5)
+#define ON_AIR_PACKET_DATA_SIZE \
+	(CRAZET_RADIO_ON_AIR_PACKET_PAYLOAD_LEN - ON_AIR_PACKET_HEADER_SIZE)
+typedef struct crazet_on_air_packet {
+	uint8_t packetSize;
+	uint8_t frameType;
+	uint8_t source_id;
+	uint8_t target_id;
+	uint8_t data_size;
+	uint8_t data[ON_AIR_PACKET_DATA_SIZE];
+}__attribute__((packed, aligned(1))) CrazetOnAirPacket;
+
+#define DATA_FRAME_HEADER_SIZE (2)
+#define DATA_FRAME_DATA_SIZE   (ON_AIR_PACKET_DATA_SIZE - DATA_FRAME_HEADER_SIZE)
+typedef struct crazet_data_frame {
+	uint8_t ack;
+	uint8_t broadcast;
+	uint8_t data[DATA_FRAME_DATA_SIZE];
+}__attribute__((packed, aligned(1))) CrazetDataFrame;
+
+#define TOKEN_FRAME_SIZE (8)
+typedef struct crazet_token_frame {
+	uint32_t tokenID;
+	uint8_t tokenDirection;
+	uint8_t failed_node_id;
+	uint8_t faile_node_pred;
+	uint8_t new_node_successor;
+}__attribute__((packed, aligned(1))) CrazetTokenFrame;
+
+typedef struct crazet_queue_packet {
+	uint32_t crc;
+	uint8_t rssi;
+	uint8_t logicalAddres;
+	CrazetOnAirPacket onAirPacket;
+}__attribute__((packed, aligned(1))) CrazetQueuePacket;
+
+/******************************************************************************/
+
+/******************************************************************************
  * CRAZET module static variable
  ******************************************************************************/
 
-static CrazetConfig crazetConfig;
+static CrazetConfig ctConfig;
 
 /* CrazeT RX FIFO-Queue */
-static CrazetPacket rxQueue[CRAZET_RX_FIFO_QUEUE_SIZE];
+static CrazetQueuePacket rxQueue[CRAZET_RX_FIFO_QUEUE_SIZE];
 static volatile uint8_t rxQueueHead = 0;
 static volatile uint8_t rxQueueTail = 0;
 
 /* CrazeT TX FIFO-Queue */
-static CrazetPacket txQueue[CRAZET_TX_FIFO_QUEUE_SIZE];
+static CrazetQueuePacket txQueue[CRAZET_TX_FIFO_QUEUE_SIZE];
 static volatile uint8_t txQueueHead = 0;
 static volatile uint8_t txQueueTail = 0;
 /******************************************************************************/
@@ -191,22 +242,22 @@ static void radioPacketSentHandler() {
 bool initCrazet(const CrazetConfig * const config) {
 
 	/* Copy CrazetConfig to module configuration. */
-	memcpy(&crazetConfig, config, sizeof(CrazetConfig));
+	memcpy(&ctConfig, config, sizeof(CrazetConfig));
 
 	/* Enable the RADIO module. */
 	CRAZET_RADIO_ENABLE();
 
 	/* Set the RADIO Bitrate. */
-	setCrazetRadioBitRate(crazetConfig.bitrate);
+	setCrazetRadioBitRate(ctConfig.bitrate);
 
 	/* Set the RADIO transmit power .*/
-	setCrazetRadioTXPower(crazetConfig.txpower);
+	setCrazetRadioTXPower(ctConfig.txpower);
 
 	/* Set the RADIO frequency channel. */
-	setCrazetRadioChannel(crazetConfig.channel);
+	setCrazetRadioChannel(ctConfig.channel);
 
 	/* Enable the RADIO CRC check for data integrity. */
-	setCrazetRadioCRC(crazetConfig.crc);
+	setCrazetRadioCRC(ctConfig.crc);
 
 	/* Configure the RADIO on air packet. */
 	configureCrazetRadioAirPacket(CRAZET_RADIO_ON_AIR_PACKET_BASE_ADDR_LEN,
@@ -224,7 +275,7 @@ bool initCrazet(const CrazetConfig * const config) {
 	updateTXAddress(DEFAULT_JOIN_ADDR);
 
 	/* Set the CRAZET self node address. */
-	updateSelfNodeAddress(crazetConfig.selfNodeAddress);
+	updateSelfNodeAddress(ctConfig.selfNodeAddress);
 
 	/* Initialize the CRAZET PPI system. */
 	enableCrazetPPISystem();
@@ -239,7 +290,18 @@ bool initCrazet(const CrazetConfig * const config) {
 
 bool readCrazetPacket(CrazetPacket *packet) {
 	if(!isRXQueueEmpty()) {
-		memcpy(packet, &rxQueue[rxQueueTail], sizeof(CrazetPacket));
+		const CrazetQueuePacket* queuedPk = &rxQueue[rxQueueTail];
+		packet->source_id = queuedPk->onAirPacket.source_id;
+		packet->target_id = queuedPk->onAirPacket.target_id;
+		packet->dataSize  = queuedPk->onAirPacket.data_size - 2;
+
+		const CrazetDataFrame* dataFrame  = (const CrazetDataFrame*)&queuedPk->onAirPacket.data;
+		packet->ack       = dataFrame->ack;
+		packet->broadcast = dataFrame->broadcast;
+
+		// TODO: Add assert (packet->dataSize <= CRAZET_MAX_PACKET_DATA_SIZE)
+		memcpy(&packet->data, &dataFrame->data, packet->dataSize);
+
 		rXQueuePop();
 		return true;
 	}
@@ -248,7 +310,18 @@ bool readCrazetPacket(CrazetPacket *packet) {
 
 bool sendCrazetPacket(const CrazetPacket * const packet) {
 	if(!isTXQueueFull()) {
-		memcpy(&txQueue[txQueueHead], packet, sizeof(CrazetPacket));
+		CrazetQueuePacket* queuePk = &txQueue[txQueueHead];
+		queuePk->onAirPacket.source_id = packet->source_id;
+		queuePk->onAirPacket.target_id = packet->target_id;
+		queuePk->onAirPacket.data_size = packet->dataSize + 2;
+
+		CrazetDataFrame* dataFrame  = (CrazetDataFrame*)&queuePk->onAirPacket.data;
+		dataFrame->ack       = packet->ack;
+		dataFrame->broadcast = packet->broadcast;
+
+		// TODO: Add assert (queuePk->onAirPacket.data_size <= ON_AIR_PACKET_DATA_SIZE)
+		memcpy(&dataFrame->data, &packet->data, packet->dataSize);
+
 		tXQueuePush();
 		return true;
 	}
