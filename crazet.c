@@ -382,6 +382,10 @@ static void sendPacketAuto(const CrazetOnAirPacket * const txPk, uint32_t logTxA
 void idleStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
 	switch(event) {
 	case TIMEOUT_EVENT:
+		servicePacket.frameType = INVITE_FRAME;
+		fsmData.state = RX_WAIT_INVITE_ACK_STATE;
+		fsmData.lastState = IDLE_STATE;
+		sendPacketAuto(&servicePacket, LOGICAL_JOIN_ADDRR, ctConfig.invitationTimeoutUs);
 		break;
 	case DATA_FRAME_EVENT:
 		break;
@@ -446,6 +450,13 @@ void rxWaitDataAckStateHandler(CrazetEvent event, const CrazetQueuePacket * cons
 void rxWaitInviteAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
 	switch(event) {
 	case TIMEOUT_EVENT:
+		if(fsmData.lastState == IDLE_STATE) {
+			fsmData.state = IDLE_STATE;
+			fsmData.lastState = RX_WAIT_INVITE_ACK_STATE;
+			CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = ctConfig.networkIdleTimeoutUs;
+			rumpUpRadioInRx();
+			break;
+		}
 		break;
 	case INVITE_ACK_FRAME_EVENT:
 		break;
