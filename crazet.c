@@ -504,10 +504,45 @@ bool initCrazet(const CrazetConfig * const config) {
 	/* Initialize the CRAZET PPI system. */
 	enableCrazetPPISystem();
 
+	/* Set the CRAZET_TIMER configuration. */
+	CRAZET_TIMER->PRESCALER = 4U;
+	CRAZET_TIMER->BITMODE = 3;
+
 	/* Initialize the CRAZET FSM. */
 	crazetRadioState = CRAZET_RADIO_RX_STATE;
 	RadioOnDisabledRXEventHandler = radioPacketReceivedHandler;
 	RadioOnDisabledTXEventHandler = radioPacketSentHandler;
+
+	resetCrazetFSMData(&fsmData);
+	initServicePacket(&servicePacket);
+
+	CRAZET_RADIO->RXADDRESSES = 1 << LOGICAL_SELF_NODE_ADDRR |
+			1 << LOGICAL_BROADCAST_ADDRR |
+			1 << LOGICAL_JOIN_ADDRR;
+
+	CRAZET_RADIO->TXADDRESS = 1 << LOGICAL_TX_ADDRR;
+
+	CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = ctConfig.networkIdleTimeoutUs;
+
+	CRAZET_TIMER->SHORTS = CRAZET_TIMER_DEFAULT_SHORTS;
+	CRAZET_RADIO->SHORTS = CRAZET_RADIO_DEFAULT_SHORTS;
+
+	PPI->CHENCLR = 0U;
+	PPI->CHENSET = (1 << PPI_RADIO_DISABLE_ON_CC0) |
+				   (1 << PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR);
+
+	/* Enable interrupt routine. */
+	CRAZET_RADIO->INTENSET = RADIO_INTENSET_DISABLED_Enabled << RADIO_INTENSET_DISABLED_Pos;
+	NVIC_SetPriority(RADIO_IRQn, 1);
+	CRAZET_RADIO_ENABLE_IRQ();
+
+	NRF_RADIO->PACKETPTR = (uint32_t)&rxQueue[rxQueueHead].onAirPacket;
+
+	/* Start the CRAZET_RADIO in RX mode. */
+	CRAZET_RADIO->TASKS_RXEN = 1U;
+
+	/* Start the CRAZET_TIMER. */
+	CRAZET_TIMER->TASKS_START = 1U;
 
 	return true;
 }
