@@ -63,6 +63,7 @@ typedef struct crazet_config_t {
 
 	uint32_t networkIdleTimeoutUs;
 	uint32_t invitationTimeoutUs;
+	uint32_t invitationRate;
 
 	uint8_t selfNodeAddress;
 } CrazetConfig;
@@ -80,6 +81,7 @@ typedef struct crazet_config_t {
 								.rtsFrameRetransmitAttempts   = 100,                        \
 								.networkIdleTimeoutUs         = 1000000,                    \
 								.invitationTimeoutUs          = 2500,                       \
+								.invitationRate               = 50,                         \
 								.selfNodeAddress              = 0x01                        \
 }
 

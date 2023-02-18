@@ -43,6 +43,8 @@
  * CRAZET constants
  ******************************************************************************/
 
+#define CRAZET_ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+
 #define LOGICAL_SELF_NODE_ADDRR  CRAZET_RADIO_LOGICAL_ADDRR_0
 #define LOGICAL_BROADCAST_ADDRR  CRAZET_RADIO_LOGICAL_ADDRR_1
 #define LOGICAL_JOIN_ADDRR       CRAZET_RADIO_LOGICAL_ADDRR_2
@@ -51,6 +53,12 @@
 #define DEFAULT_BRAODCAST_ADDRR (0xFF)
 #define DEFAULT_JOIN_ADDR       (0xFE)
 #define DEFAULT_TX_ADDRR        DEFAULT_JOIN_ADDR
+
+#define CRAZET_STOP_RX_JOIN_ADDR()                                   \
+		{	CRAZET_RADIO->RXADDRESSES &= ~(1 << LOGICAL_JOIN_ADDRR); }
+
+#define CRAZET_START_RX_JOIN_ADDR()                                  \
+		{	CRAZET_RADIO->RXADDRESSES |= (1 << LOGICAL_JOIN_ADDRR); }
 
 #define CRAZET_RADIO_DEFAULT_SHORTS (RADIO_SHORTS_READY_START_Enabled       << RADIO_SHORTS_READY_START_Pos       | \
 									 RADIO_SHORTS_ADDRESS_RSSISTART_Enabled << RADIO_SHORTS_ADDRESS_RSSISTART_Pos | \
@@ -61,6 +69,9 @@
 									 TIMER_SHORTS_COMPARE0_STOP_Enabled  << TIMER_SHORTS_COMPARE0_STOP_Pos)
 
 #define CRAZET_TIMER_CC0_REG 0
+
+#define CRAZET_TOKEN_CLOCKWISE_DIRECTION      (0)
+#define CRAZET_TOKEN_ANTI_CLOCKWISE_DIRECTION (1)
 
 /* CrazeT RX and TX FIFO queue sizes */
 #define CRAZET_RX_FIFO_QUEUE_SIZE 32
@@ -125,7 +136,7 @@ typedef struct crazet_token_frame {
 	uint32_t tokenID;
 	uint8_t tokenDirection;
 	uint8_t failed_node_id;
-	uint8_t faile_node_pred;
+	uint8_t failed_node_pred;
 	uint8_t new_node_successor;
 }__attribute__((packed, aligned(1))) CrazetTokenFrame;
 
@@ -255,8 +266,12 @@ typedef struct crazet_finite_state_machine_data {
 
 	bool is_network_active;
 	uint8_t token_direction;
+	bool is_token_direction_iverted;
 	uint32_t token_id;
+	uint32_t lastInviteToken_id;
+	bool amITokenCreator;
 
+	CrazetTokenFrame tokenFrame;
 	CrazetOnAirPacket* retransmitPacket;
 } CrazetFSMData;
 
@@ -277,9 +292,12 @@ static void resetCrazetFSMData(CrazetFSMData* data) {
 	data->state     = IDLE_STATE;
 	data->lastState = IDLE_STATE;
 
-	data->is_network_active = false;
-	data->token_direction   = 0;
-	data->token_id          = 0;
+	data->is_network_active         = false;
+	data->token_direction           = 0;
+	data->token_id                  = 0;
+	data->lastInviteToken_id        = 0;
+	data->amITokenCreator           = false;
+	data->is_token_direction_iverted = false;
 
 	data->retransmitPacket = &servicePacket;
 }
@@ -290,33 +308,473 @@ static void initServicePacket(CrazetOnAirPacket* pk) {
 	pk->target_id  = ctConfig.selfNodeAddress;
 }
 
-typedef void(*CrazetStateHandler)(CrazetEvent event, const CrazetQueuePacket * const pk);
+static void sendRadioPacketAuto(const CrazetOnAirPacket * const txPk, uint32_t logTxAddres, uint32_t timeout) {
+	CRAZET_RADIO->PACKETPTR = (uint32_t)txPk;
+	CRAZET_RADIO->TXADDRESS = logTxAddres;
 
-static void idleStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
-static void rxWaitCtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
-static void rxWaitRtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
-static void rxWaitDataAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
-static void rxWaitInviteAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk);
+	CRAZET_RADIO->SHORTS = CRAZET_RADIO_DEFAULT_SHORTS |
+			RADIO_SHORTS_DISABLED_RXEN_Enabled << RADIO_SHORTS_DISABLED_RXEN_Pos;
 
-static CrazetStateHandler stateHandler[] = {
-		[IDLE_STATE]               = idleStateHandler,
-		[RX_WAIT_CTS_STATE]        = rxWaitCtsStateHandler,
-		[RX_WAIT_RTS_STATE]        = rxWaitRtsStateHandler,
-		[RX_WAIT_DATA_ACK_STATE]   = rxWaitDataAckStateHandler,
-		[RX_WAIT_INVITE_ACK_STATE] = rxWaitInviteAckStateHandler
-};
+	crazetRadioState = CRAZET_RADIO_TX_STATE;
 
-/* Handler to be called when a packet has been received. */
-static void radioPacketReceivedHandler();
-/* Handler to be called when a packet has been sent. */
-static void radioPacketSentHandler();
+	CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = timeout;
+
+	CRAZET_RADIO->TASKS_TXEN = 1U;
+}
+
+static void sendRadioPacketManual(const CrazetOnAirPacket * const txPk, uint32_t logTxAddres) {
+	CRAZET_RADIO->PACKETPTR = (uint32_t)txPk;
+	CRAZET_RADIO->TXADDRESS = logTxAddres;
+
+	CRAZET_RADIO_DISABLE_IRQ();
+	PPI->CHENCLR = 0U;
+
+	CRAZET_RADIO->TASKS_TXEN = 1U;
+
+	while(CRAZET_RADIO->EVENTS_DISABLED == 0U);
+
+	CRAZET_RADIO_ENABLE_IRQ();
+	PPI->CHENSET = (1 << PPI_RADIO_DISABLE_ON_CC0) |
+				   (1 << PPI_TIMER_SHUTDOWN_ON_RADIO_ADDR);
+}
 
 static void rumpUpRadioInRx() {
+ 	CRAZET_RADIO->TASKS_RXEN = 1U;
+ 	CRAZET_TIMER->TASKS_START = 1U;
+}
+
+/******************************************************************************
+ * IDLE_STATE Event handler functions
+ ******************************************************************************/
+static void on_idle_timeout_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+
+	CrazetOnAirPacket* txPk = &servicePacket;
+	txPk->frameType  = INVITE_FRAME;
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+
+	fsmData.state             = RX_WAIT_INVITE_ACK_STATE;
+	fsmData.lastState         = IDLE_STATE;
+
+	sendRadioPacketAuto(txPk, LOGICAL_JOIN_ADDRR, ctConfig.invitationTimeoutUs);
+}
+
+static void on_idle_token_frame_event(const CrazetQueuePacket * const rxPk) {
+	const CrazetTokenFrame* rxTokenFrame = (const CrazetTokenFrame*)rxPk->onAirPacket.data;
+
+	CrazetOnAirPacket* txPk = &servicePacket;
+
+	fsmData.amITokenCreator = false;
+
+	if(fsmData.is_network_active) {
+
+		if(rxTokenFrame->tokenID == fsmData.token_id) {
+			fsmData.token_id++;
+			fsmData.amITokenCreator = true;
+		} else {
+
+			if(rxTokenFrame->tokenID < fsmData.token_id && rxTokenFrame != 0) {
+				/* Received token is not valid. Just send RTS frame
+				 * to sender, to destroy invalid token. */
+				txPk->target_id = rxPk->onAirPacket.source_id;
+				updateTXAddress(txPk->target_id);
+				sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.networkIdleTimeoutUs);
+				return;
+			}
+			fsmData.token_id = rxTokenFrame->tokenID;
+		}
+
+	} else {
+		fsmData.is_network_active = true;
+		CRAZET_STOP_RX_JOIN_ADDR();
+
+		fsmData.token_id        = rxTokenFrame->tokenID;
+		fsmData.token_direction = rxTokenFrame->tokenDirection;
+
+		fsmData.successor_id   = rxTokenFrame->new_node_successor;
+		fsmData.predecessor_id = rxPk->onAirPacket.source_id;
+	}
+
+	if(rxTokenFrame->tokenDirection != fsmData.token_direction) {
+		fsmData.token_direction = rxTokenFrame->tokenDirection;
+
+		if(rxTokenFrame->failed_node_id == fsmData.successor_id) {
+			fsmData.successor_id = rxTokenFrame->failed_node_pred;
+
+			fsmData.tokenFrame.failed_node_pred = ctConfig.selfNodeAddress;
+			fsmData.tokenFrame.failed_node_id  = ctConfig.selfNodeAddress;
+
+		} else {
+			fsmData.successor_id = fsmData.predecessor_id;
+
+			fsmData.tokenFrame.failed_node_pred = rxTokenFrame->failed_node_pred;
+			fsmData.tokenFrame.failed_node_id  = rxTokenFrame->failed_node_id;
+		}
+	}
+
+	fsmData.tokenFrame.tokenID        = fsmData.token_id;
+	fsmData.tokenFrame.tokenDirection = fsmData.token_direction;
+
+	fsmData.data_frame_crc = 0;
+	fsmData.data_frame_src = ctConfig.selfNodeAddress;
+
+	fsmData.predecessor_id = rxPk->onAirPacket.source_id;
+
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+	txPk->frameType  = CTS_FRAME;
+	txPk->target_id  = fsmData.predecessor_id;
+
+	fsmData.retransmitPacket = txPk;
+	fsmData.rts_retries = 0;
+
+	fsmData.state     = RX_WAIT_CTS_STATE;
+	fsmData.lastState = IDLE_STATE;
+
+	updateTXAddress(txPk->target_id);
+	sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.rtsFrameRetransmitUsDelay);
+}
+
+static void on_idle_data_frame_event(const CrazetQueuePacket * const rxPk) {
+	/* Check if received DATA_FRAME is a new one. */
+	if(rxPk->crc == fsmData.data_frame_crc &&
+			rxPk->onAirPacket.source_id == fsmData.data_frame_src) {
+
+		/* Update data of the DATA_FRAME. */
+		fsmData.data_frame_crc = rxPk->crc;
+		fsmData.data_frame_src = rxPk->onAirPacket.source_id;
+
+		if(!isRXQueueFull()) {
+			// Push new DATA_FRAME in the rxQueue;
+			rXQueuePush();
+		} else {
+			// TODO: Raise rxQueue full
+		}
+
+
+	} else {
+		// TODO: Raise duplicated DATA_FRAME
+	}
+
+	const CrazetDataFrame* rxDataFrame = (const CrazetDataFrame*)&rxPk->onAirPacket.data;
+	if(rxDataFrame->broadcast == 1 || rxDataFrame->ack != 1) {
+		/* Received DATA_FRAME is either broadcast or no ack. */
+		rumpUpRadioInRx();
+		return;
+	}
+
+	CrazetOnAirPacket *txPk = &servicePacket;
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+	txPk->target_id = txPk->source_id;
+	txPk->frameType = DATA_ACK_FRAME;
+
+	updateTXAddress(txPk->target_id);
+	sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.networkIdleTimeoutUs);
+}
+
+static void on_idle_rts_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	// TODO: Assert pk->onAirPacket.source_id == fsmData.successor_id
+	sendRadioPacketAuto(fsmData.retransmitPacket, LOGICAL_TX_ADDRR, ctConfig.networkIdleTimeoutUs);
+}
+
+static void on_idle_invite_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	CrazetOnAirPacket *txPk = &servicePacket;
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+	txPk->target_id = txPk->source_id;
+	txPk->frameType = INVITE_ACK_FRAME;
+
+	updateTXAddress(txPk->source_id);
+	sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.networkIdleTimeoutUs);
+}
+/******************************************************************************/
+
+static bool shouldInvite() {
+	if(fsmData.amITokenCreator &&
+			((fsmData.token_id - fsmData.lastInviteToken_id) > ctConfig.invitationRate)) {
+
+		fsmData.lastInviteToken_id = fsmData.token_id;
+		return true;
+	}
+	return false;
+}
+
+static void sendInviteFrame() {
+	CrazetOnAirPacket* txPk = &servicePacket;
+	txPk->frameType  = INVITE_FRAME;
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+
+	fsmData.state = RX_WAIT_INVITE_ACK_STATE;
+	sendRadioPacketAuto(txPk, LOGICAL_JOIN_ADDRR, ctConfig.invitationTimeoutUs);
+}
+
+static void sendTokenFrame() {
+	CrazetOnAirPacket* txPk = &servicePacket;
+	txPk->frameType  = TOKEN_FRAME;
+	txPk->data_size  = TOKEN_FRAME_SIZE;
+	txPk->packetSize = txPk->data_size + ON_AIR_PACKET_HEADER_SIZE;
+	txPk->target_id  = fsmData.successor_id;
+
+	memcpy(txPk->data, &fsmData.tokenFrame, TOKEN_FRAME_SIZE);
+
+	fsmData.token_retries    = 0;
+	fsmData.retransmitPacket = txPk;
+	fsmData.state            = RX_WAIT_RTS_STATE;
+
+	updateTXAddress(txPk->target_id);
+	sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.tokenFrameRetransmitUsDelay);
+}
+
+/******************************************************************************
+ * RX_WAIT_CTS_STATE Event handler functions
+ ******************************************************************************/
+static void on_wait_cts_next_action() {
+
+	fsmData.lastState = RX_WAIT_CTS_STATE;
+
+	if(!isTXQueueEmpty()) {
+		CrazetOnAirPacket* txPk = &txQueue[txQueueHead].onAirPacket;
+		const CrazetDataFrame* txDataFrame = (const CrazetDataFrame*)&txPk->data;
+
+		// TODO: Add define for ack and broadcast
+		if(txDataFrame->ack == 1) {
+
+			fsmData.retransmitPacket = txPk;
+			fsmData.data_retries = 0;
+
+			fsmData.state = RX_WAIT_DATA_ACK_STATE;
+			updateTXAddress(txPk->target_id);
+			sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.dataFrameRetransmitUsDelay);
+			return;
+		}
+
+		uint8_t txLogAddr;
+
+		if(txDataFrame->broadcast == 1) {
+			txLogAddr = LOGICAL_BROADCAST_ADDRR;
+		} else {
+			updateTXAddress(txPk->target_id);
+			txLogAddr = LOGICAL_TX_ADDRR;
+		}
+		sendRadioPacketManual(txPk, txLogAddr);
+		tXQueuePop();
+	}
+
+	if(shouldInvite()) {
+		sendInviteFrame();
+		return;
+	}
+	sendTokenFrame();
+}
+
+static void on_wait_cts_timeout_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	if(fsmData.rts_retries < ctConfig.rtsFrameRetransmitAttempts) {
+		fsmData.rts_retries++;
+		sendRadioPacketAuto(fsmData.retransmitPacket, LOGICAL_TX_ADDRR, ctConfig.rtsFrameRetransmitUsDelay);
+		return;
+	}
+	//TODO: Raise error CTS_FRAME failed to receive
+	on_wait_cts_next_action();
+}
+
+static void on_wait_cts_token_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	fsmData.rts_retries = 0;
+	sendRadioPacketAuto(fsmData.retransmitPacket, LOGICAL_TX_ADDRR, ctConfig.dataFrameRetransmitUsDelay);
+}
+
+static void on_wait_cts_cts_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	on_wait_cts_next_action();
+}
+/******************************************************************************/
+
+/******************************************************************************
+ * RX_WAIT_DATA_ACK Event handler functions
+ ******************************************************************************/
+static void on_wait_data_ack_next_action() {
+	tXQueuePush();
+	fsmData.lastState = RX_WAIT_DATA_ACK_STATE;
+	if(shouldInvite()) {
+		sendInviteFrame();
+		return;
+	}
+	sendTokenFrame();
+}
+
+static void on_wait_data_ack_timeout_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	if(fsmData.data_retries < ctConfig.dataFrameRetransmitAttempts) {
+		fsmData.data_retries++;
+		sendRadioPacketAuto(fsmData.retransmitPacket, LOGICAL_TX_ADDRR, ctConfig.dataFrameRetransmitUsDelay);
+		return;
+	}
+	// TODO: Raise an error
+	on_wait_data_ack_next_action();
+}
+
+static void on_wait_data_ack_data_ack_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	on_wait_data_ack_next_action();
+}
+/******************************************************************************/
+
+/******************************************************************************
+ * RX_WAIT_INVITE_ACK Event handler functions
+ ******************************************************************************/
+static void on_wait_invite_ack_timeout_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	if(fsmData.lastState == IDLE_STATE) {
+		fsmData.state = IDLE_STATE;
+		fsmData.lastState = RX_WAIT_INVITE_ACK_STATE;
+
+		fsmData.is_network_active = false;
+		CRAZET_START_RX_JOIN_ADDR();
+
+		CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = ctConfig.networkIdleTimeoutUs;
+		rumpUpRadioInRx();
+		return;
+	}
+	fsmData.lastState = RX_WAIT_INVITE_ACK_STATE;
+	sendTokenFrame();
+}
+
+static void on_wait_invite_ack_invite_ack_frame_event(const CrazetQueuePacket * const rxPk) {
+
+	if(fsmData.lastState == IDLE_STATE) {
+		fsmData.token_id++;
+		fsmData.tokenFrame.tokenID = fsmData.token_id;
+		fsmData.is_network_active = true;
+		CRAZET_STOP_RX_JOIN_ADDR();
+	}
+
+	fsmData.tokenFrame.new_node_successor = fsmData.successor_id;
+	fsmData.successor_id = rxPk->onAirPacket.source_id;
+
+	fsmData.lastState = RX_WAIT_INVITE_ACK_STATE;
+	sendTokenFrame();
+}
+/******************************************************************************/
+
+
+/******************************************************************************
+ * RX_WAIT_RTS_STATE Event handler functions
+ ******************************************************************************/
+static void on_wait_rts_timeout_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	if(fsmData.token_retries < ctConfig.tokenFrameRetransmitAttempts) {
+		fsmData.token_retries++;
+		sendRadioPacketAuto(fsmData.retransmitPacket, LOGICAL_TX_ADDRR, ctConfig.tokenFrameRetransmitUsDelay);
+		return;
+	}
+
+	if(fsmData.is_token_direction_iverted) {
+		fsmData.is_token_direction_iverted = false;
+		fsmData.is_network_active = false;
+		CRAZET_START_RX_JOIN_ADDR();
+
+		fsmData.state     = IDLE_STATE;
+		fsmData.lastState = RX_WAIT_RTS_STATE;
+
+		CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = ctConfig.networkIdleTimeoutUs;
+		rumpUpRadioInRx();
+		return;
+	}
+
+	fsmData.is_token_direction_iverted = true;
+	if(fsmData.token_direction == CRAZET_TOKEN_CLOCKWISE_DIRECTION) {
+		fsmData.token_direction = CRAZET_TOKEN_ANTI_CLOCKWISE_DIRECTION;
+	} else {
+		fsmData.token_direction = CRAZET_TOKEN_CLOCKWISE_DIRECTION;
+	}
+
+	fsmData.tokenFrame.failed_node_id   = fsmData.successor_id;
+	fsmData.tokenFrame.failed_node_pred = ctConfig.selfNodeAddress;
+
+	fsmData.successor_id = fsmData.predecessor_id;
+
+	sendTokenFrame();
+}
+
+static void on_wait_rts_rts_frame_event(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	CrazetOnAirPacket* txPk = &servicePacket;
+
+	txPk->packetSize = ON_AIR_PACKET_HEADER_SIZE;
+	txPk->data_size  = 0;
+	txPk->frameType  = CTS_FRAME;
+	txPk->target_id  = fsmData.successor_id;
+
+	fsmData.is_token_direction_iverted = false;
+
+	fsmData.state     = IDLE_STATE;
+	fsmData.lastState = RX_WAIT_RTS_STATE;
+
+	updateTXAddress(txPk->target_id);
+	sendRadioPacketAuto(txPk, LOGICAL_TX_ADDRR, ctConfig.networkIdleTimeoutUs);
+}
+/******************************************************************************/
+
+
+static void crazet_stub_handler(const CrazetQueuePacket * const rxPk) {
+	(void)rxPk;
+	/* TODO: Raise an error */
 	CRAZET_RADIO->TASKS_RXEN = 1U;
 	CRAZET_TIMER->TASKS_START = 1U;
 }
 
-void radioPacketReceivedHandler() {
+typedef void(*CrazetEventHandler)(const CrazetQueuePacket * const rxPk);
+
+typedef struct event_handlers {
+	CrazetEvent event;
+	CrazetEventHandler handler;
+} EventHandlers;
+
+static const EventHandlers idleStateHandlers[] = {
+		{TIMEOUT_EVENT,      on_idle_timeout_event     },
+		{TOKEN_FRAME_EVENT,  on_idle_token_frame_event },
+		{DATA_FRAME_EVENT,   on_idle_data_frame_event  },
+		{RTS_FRAME_EVENT,    on_idle_rts_frame_event   },
+		{INVITE_FRAME_EVENT, on_idle_invite_frame_event}
+};
+
+static const EventHandlers rxWaitCtsStateHandlers[] = {
+		{TIMEOUT_EVENT,     on_wait_cts_timeout_event    },
+		{TOKEN_FRAME_EVENT, on_wait_cts_token_frame_event},
+		{CTS_FRAME_EVENT,   on_wait_cts_cts_frame_event  }
+};
+
+static const EventHandlers rxWaitRtsStateHandlers[] = {
+		{TIMEOUT_EVENT,   on_wait_rts_timeout_event  },
+		{RTS_FRAME_EVENT, on_wait_rts_rts_frame_event}
+};
+
+static const EventHandlers rxWaitDataAckStateHandlers[] = {
+		{TIMEOUT_EVENT,        on_wait_data_ack_timeout_event       },
+		{DATA_ACK_FRAME_EVENT, on_wait_data_ack_data_ack_frame_event}
+};
+
+static const EventHandlers rxWaitInviteAckStateHandlers[] = {
+		{TIMEOUT_EVENT,          on_wait_invite_ack_timeout_event         },
+		{INVITE_ACK_FRAME_EVENT, on_wait_invite_ack_invite_ack_frame_event}
+};
+
+typedef struct state {
+	int handlerCounts;
+	const EventHandlers *handlers;
+} StateMachine;
+
+static const StateMachine stateMachine[] = {
+	[IDLE_STATE]               = {CRAZET_ARRAY_SIZE(idleStateHandlers)            ,idleStateHandlers},
+	[RX_WAIT_CTS_STATE]        = {CRAZET_ARRAY_SIZE(rxWaitCtsStateHandlers)       ,rxWaitCtsStateHandlers},
+	[RX_WAIT_RTS_STATE]        = {CRAZET_ARRAY_SIZE(rxWaitRtsStateHandlers)       ,rxWaitRtsStateHandlers},
+	[RX_WAIT_DATA_ACK_STATE]   = {CRAZET_ARRAY_SIZE(rxWaitDataAckStateHandlers)   ,rxWaitDataAckStateHandlers},
+	[RX_WAIT_INVITE_ACK_STATE] = {CRAZET_ARRAY_SIZE(rxWaitInviteAckStateHandlers) ,rxWaitInviteAckStateHandlers},
+};
+
+/* Handler to be called when a packet has been received. */
+static void radioPacketReceivedHandler() {
 
 	CrazetEvent event;
 	CrazetQueuePacket* rxPk;
@@ -347,10 +805,18 @@ void radioPacketReceivedHandler() {
 		return;
 	}
 
-	/* Call the handler of the currentState */
-	stateHandler[fsmData.state](event, rxPk);
+	/* Call the handler of the event handler of the current state. */
+	CrazetEventHandler handler = crazet_stub_handler;
+	for(int i = 0; i < stateMachine[fsmData.state].handlerCounts; i++) {
+		if(event == stateMachine[fsmData.state].handlers[i].event) {
+			handler = stateMachine[fsmData.state].handlers[i].handler;
+			break;
+		}
+	}
+	handler(rxPk);
 }
 
+/* Handler to be called when a packet has been sent. */
 static void radioPacketSentHandler() {
 	/*
 	 * CRAZET_RADIO is already starting to rump in in RX state,
@@ -365,108 +831,6 @@ static void radioPacketSentHandler() {
 	CRAZET_TIMER->TASKS_START = 1U;
 }
 
-static void sendPacketAuto(const CrazetOnAirPacket * const txPk, uint32_t logTxAddres, uint32_t timeout) {
-	CRAZET_RADIO->PACKETPTR = (uint32_t)txPk;
-	CRAZET_RADIO->TXADDRESS = logTxAddres;
-
-	CRAZET_RADIO->SHORTS = CRAZET_RADIO_DEFAULT_SHORTS |
-			RADIO_SHORTS_DISABLED_RXEN_Enabled << RADIO_SHORTS_DISABLED_RXEN_Pos;
-
-	crazetRadioState = CRAZET_RADIO_TX_STATE;
-
-	CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = timeout;
-
-	CRAZET_RADIO->TASKS_TXEN = 1U;
-}
-
-void idleStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
-	switch(event) {
-	case TIMEOUT_EVENT:
-		servicePacket.frameType = INVITE_FRAME;
-		fsmData.state = RX_WAIT_INVITE_ACK_STATE;
-		fsmData.lastState = IDLE_STATE;
-		sendPacketAuto(&servicePacket, LOGICAL_JOIN_ADDRR, ctConfig.invitationTimeoutUs);
-		break;
-	case DATA_FRAME_EVENT:
-		break;
-	case TOKEN_FRAME_EVENT:
-		break;
-	case RTS_FRAME_EVENT:
-		break;
-	case INVITE_FRAME_EVENT:
-		break;
-	default:
-		// TODO: Raise an error
-		/* In stable network should never occur. */
-		rumpUpRadioInRx();
-		break;
-	}
-}
-
-void rxWaitCtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
-	switch(event) {
-	case TIMEOUT_EVENT:
-		break;
-	case CTS_FRAME_EVENT:
-		break;
-	case TOKEN_FRAME_EVENT:
-		break;
-	default:
-		// TODO: Raise an error
-		/* In stable network should never occur. */
-		rumpUpRadioInRx();
-		return;
-	}
-}
-
-void rxWaitRtsStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
-	switch(event) {
-	case TIMEOUT_EVENT:
-		break;
-	case RTS_FRAME_EVENT:
-		break;
-	default:
-		// TODO: Raise an error
-		/* In stable network should never occur. */
-		rumpUpRadioInRx();
-		return;
-	}
-}
-
-void rxWaitDataAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
-	switch(event) {
-	case TIMEOUT_EVENT:
-		break;
-	case DATA_ACK_FRAME_EVENT:
-		break;
-	default:
-		// TODO: Raise an error
-		/* In stable network should never occur. */
-		rumpUpRadioInRx();
-		return;
-	}
-}
-
-void rxWaitInviteAckStateHandler(CrazetEvent event, const CrazetQueuePacket * const pk) {
-	switch(event) {
-	case TIMEOUT_EVENT:
-		if(fsmData.lastState == IDLE_STATE) {
-			fsmData.state = IDLE_STATE;
-			fsmData.lastState = RX_WAIT_INVITE_ACK_STATE;
-			CRAZET_TIMER->CC[CRAZET_TIMER_CC0_REG] = ctConfig.networkIdleTimeoutUs;
-			rumpUpRadioInRx();
-			break;
-		}
-		break;
-	case INVITE_ACK_FRAME_EVENT:
-		break;
-	default:
-		// TODO: Raise an error
-		/* In stable network should never occur. */
-		rumpUpRadioInRx();
-		return;
-	}
-}
 /******************************************************************************/
 
 
@@ -584,6 +948,9 @@ bool sendCrazetPacket(const CrazetPacket * const packet) {
 		queuePk->onAirPacket.source_id = packet->source_id;
 		queuePk->onAirPacket.target_id = packet->target_id;
 		queuePk->onAirPacket.data_size = packet->dataSize + 2;
+
+		queuePk->onAirPacket.packetSize = queuePk->onAirPacket.data_size + ON_AIR_PACKET_HEADER_SIZE;
+		queuePk->onAirPacket.frameType = DATA_FRAME;
 
 		CrazetDataFrame* dataFrame  = (CrazetDataFrame*)&queuePk->onAirPacket.data;
 		dataFrame->ack       = packet->ack;
